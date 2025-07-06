@@ -25,11 +25,18 @@ SUBGRAPH_URLS = {
     "arbitrum": "https://gateway.thegraph.com/api/subgraphs/id/XsJn88DNCHJ1kgTqYeTgHMQSK4LuG1LR75339QVeQ26",
 }
 
-DEFAULT_CHAINS = ["katana", "base", "mainnet", "arbitrum"]
+DEFAULT_CHAINS = ["mainnet", "katana", "base", "arbitrum"]
+
+AAVE_SUBGRAPH_URLS = {
+    "mainnet": "https://gateway.thegraph.com/api/subgraphs/id/Cd2gEDVeqnjBn1hSeqFMitw8Q1iiyV9FYUZkLNRcL87g",
+    "base": "https://gateway.thegraph.com/api/subgraphs/id/GQFbb95cE6d8mV989mL5figjaGaKCQB3xqYrr1bRyXqF",
+    "arbitrum": "https://gateway.thegraph.com/api/subgraphs/id/DLuE98kEb5pQNXAcKFQGQgfSQ57Xdou4jnVbAEqMfy3B",
+}
+DEFAULT_AAVE_CHAINS = ["mainnet", "base", "arbitrum"]
 
 def fetch_morpho_market_data(market_name=None, top_n=1, subgraph_url=None):
     if not subgraph_url:
-        subgraph_url = SUBGRAPH_URLS["base"]
+        subgraph_url = SUBGRAPH_URLS["mainnet"]
     headers = {"Authorization": f"Bearer {THE_GRAPH_API_KEY}"}
     if market_name:
         query = {
@@ -107,6 +114,53 @@ def get_market_pros_cons(market):
         return response.json()['choices'][0]['message']['content']
     except Exception as e:
         return f"(Could not fetch pros/cons: {e})"
+
+def fetch_aave_pools_data(top_n=1, subgraph_url=None):
+    if not subgraph_url:
+        subgraph_url = AAVE_SUBGRAPH_URLS["mainnet"]
+    headers = {"Authorization": f"Bearer {THE_GRAPH_API_KEY}"}
+    query = {
+        "query": f'''
+        {{
+          pools(first: {top_n}) {{
+            id
+            active
+            reserves {{
+              id
+              symbol
+              name
+              totalLiquidity
+              isActive
+            }}
+          }}
+        }}
+        '''
+    }
+    try:
+        r = requests.post(subgraph_url, json=query, headers=headers)
+        return r
+    except Exception as e:
+        return e
+
+def aggregate_aave_pools_by_tvl(pools):
+    # Returns a list of dicts: [{id, tvl, reserves, ...}]
+    result = []
+    for pool in pools:
+        tvl = 0
+        for reserve in pool.get('reserves', []):
+            try:
+                tvl += float(reserve.get('totalLiquidity', 0))
+            except Exception:
+                continue
+        result.append({
+            'id': pool['id'],
+            'active': pool.get('active', False),
+            'reserves': pool.get('reserves', []),
+            'tvl': tvl
+        })
+    # Sort by TVL descending
+    result.sort(key=lambda x: x['tvl'], reverse=True)
+    return result
 
 agent = Agent()
 protocol = Protocol(spec=chat_protocol_spec)
@@ -215,6 +269,102 @@ async def handle_message(ctx: Context, sender: str, msg: ChatMessage):
                     response = "No market data found across all chains."
         else:
             ctx.logger.info("No matching branch found for user prompt.")
+
+        # --- Aave logic ---
+        if "aave" in lower_text:
+            chain = None
+            for c in AAVE_SUBGRAPH_URLS:
+                if c in lower_text:
+                    chain = c
+                    break
+            if chain:
+                ctx.logger.info(f"Querying Aave subgraph for top {top_n} pools on {chain}")
+                r = fetch_aave_pools_data(top_n=top_n, subgraph_url=AAVE_SUBGRAPH_URLS[chain])
+                if isinstance(r, Exception):
+                    ctx.logger.error(f"Exception during fetch: {r}")
+                    response = f"Error fetching Aave data: {r}"
+                else:
+                    ctx.logger.info(f"Subgraph response status: {r.status_code}")
+                    if r.ok:
+                        data = r.json()
+                        ctx.logger.info(f"Subgraph response data: {data}")
+                        pools = data['data']['pools']
+                        ranked = aggregate_aave_pools_by_tvl(pools)
+                        if ranked:
+                            lines = []
+                            for i, pool in enumerate(ranked[:top_n], 1):
+                                pros_cons = get_market_pros_cons({
+                                    'name': pool['id'],
+                                    'totalValueLockedUSD': pool['tvl'],
+                                    'totalSupply': 'N/A',
+                                    'totalBorrow': 'N/A',
+                                    'isActive': pool['active']
+                                })
+                                lines.append(
+                                    f"{i}. Pool {pool['id']} | TVL: ${pool['tvl']:,.2f} | Active: {pool['active']}\n{pros_cons}"
+                                )
+                            response = f"Top {len(ranked[:top_n])} Aave Pools by TVL on {chain.capitalize()}:\n" + "\n".join(lines)
+                            if "best" in lower_text or "top 1" in lower_text:
+                                pool = ranked[0]
+                                reasoning = get_market_reasoning({
+                                    'name': pool['id'],
+                                    'totalValueLockedUSD': pool['tvl'],
+                                    'totalSupply': 'N/A',
+                                    'totalBorrow': 'N/A',
+                                    'isActive': pool['active']
+                                }, rank=1)
+                                response += (
+                                    f"\n\nBest Pool:\nPool {pool['id']}\nTVL: ${pool['tvl']:,.2f}\nActive: {pool['active']}\nReason: {reasoning}"
+                                )
+                        else:
+                            response = f"No Aave pool data found for {chain}."
+                    else:
+                        ctx.logger.error(f"Failed to fetch Aave data: {r.text}")
+                        response = f"Failed to fetch Aave data: {r.text}"
+            else:
+                # Aggregate from all chains
+                all_pools = []
+                for c in DEFAULT_AAVE_CHAINS:
+                    ctx.logger.info(f"Querying Aave subgraph for top {top_n} pools on {c}")
+                    r = fetch_aave_pools_data(top_n=top_n, subgraph_url=AAVE_SUBGRAPH_URLS[c])
+                    if isinstance(r, Exception) or not r.ok:
+                        ctx.logger.error(f"Failed to fetch Aave data for {c}: {getattr(r, 'text', r)}")
+                        continue
+                    data = r.json()
+                    pools = data['data']['pools']
+                    ranked = aggregate_aave_pools_by_tvl(pools)
+                    for pool in ranked:
+                        pool['chain'] = c
+                        all_pools.append(pool)
+                all_pools.sort(key=lambda x: x['tvl'], reverse=True)
+                if all_pools:
+                    lines = []
+                    for i, pool in enumerate(all_pools[:top_n], 1):
+                        pros_cons = get_market_pros_cons({
+                            'name': pool['id'],
+                            'totalValueLockedUSD': pool['tvl'],
+                            'totalSupply': 'N/A',
+                            'totalBorrow': 'N/A',
+                            'isActive': pool['active']
+                        })
+                        lines.append(
+                            f"{i}. Pool {pool['id']} | Chain: {pool['chain'].capitalize()} | TVL: ${pool['tvl']:,.2f} | Active: {pool['active']}\n{pros_cons}"
+                        )
+                    response = f"Top {len(lines)} Aave Pools by TVL (All Chains):\n" + "\n".join(lines)
+                    if "best" in lower_text or "top 1" in lower_text:
+                        pool = all_pools[0]
+                        reasoning = get_market_reasoning({
+                            'name': pool['id'],
+                            'totalValueLockedUSD': pool['tvl'],
+                            'totalSupply': 'N/A',
+                            'totalBorrow': 'N/A',
+                            'isActive': pool['active']
+                        }, rank=1)
+                        response += (
+                            f"\n\nBest Pool:\nPool {pool['id']} | Chain: {pool['chain'].capitalize()}\nTVL: ${pool['tvl']:,.2f}\nActive: {pool['active']}\nReason: {reasoning}"
+                        )
+                else:
+                    response = "No Aave pool data found across all chains."
     except Exception as e:
         ctx.logger.exception(f"Error fetching Morpho data: {e}")
         response = f"Error fetching Morpho data: {e}"
